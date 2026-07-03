@@ -32,6 +32,9 @@ LOGIN_SELECTOR = "input[aria-label='Электронная почта']"
 PASSWORD_SELECTOR = "input[aria-label='Пароль']"
 SUBMIT_SELECTOR = "button.login-button"
 
+PAGE_WAIT_SECONDS = 5
+NEW_RESPONSES_SLICE = 20
+
 
 def _load_credentials() -> tuple[str, str]:
     login = os.getenv("FIRPO_LOGIN", "admin")
@@ -80,6 +83,73 @@ def _find_all_valid(responses: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return valid
 
 
+async def _save_valid_records(
+    records: list[dict[str, Any]],
+) -> int:
+    saved_count = 0
+    valid_count = len(records)
+    for idx, record_data in enumerate(records, 1):
+        try:
+            record = await sync_to_async(ExerciseRecord.from_api_response)(record_data)
+            await sync_to_async(record.save)()
+            saved_count += 1
+            logger.info(
+                "  [%d/%d] ✓ %s — %s (score=%s)",
+                idx, valid_count,
+                record.user_name,
+                record.task_title,
+                record.result_score,
+            )
+        except IntegrityError:
+            logger.info(
+                "  [%d/%d] – %s — %s (already exists, skipped)",
+                idx, valid_count,
+                record_data.get("userName", "?"),
+                record_data.get("taskTitle", "?"),
+            )
+        except Exception as exc:
+            logger.warning(
+                "  [%d/%d] ✗ Failed to save record #%s: %s",
+                idx, valid_count,
+                record_data.get("id", "?"),
+                exc,
+            )
+    return saved_count
+
+
+async def _process_page(
+    captured_responses: list[dict[str, Any]],
+    page_num: int,
+    slice_start: int = 0,
+) -> int:
+    total = len(captured_responses)
+    new_responses = captured_responses[slice_start:]
+    scan_pool = new_responses[-NEW_RESPONSES_SLICE:] if len(new_responses) > NEW_RESPONSES_SLICE else new_responses
+
+    if not scan_pool:
+        logger.info("  No new responses to scan on page %d", page_num)
+        return 0
+
+    logger.info(
+        "  Scanning %d new response(s) (slice start=%d, total=%d)",
+        len(scan_pool),
+        slice_start,
+        total,
+    )
+
+    valid_records = _find_all_valid(scan_pool)
+    if not valid_records:
+        logger.info("  No valid records found on page %d", page_num)
+        return 0
+
+    logger.info("─" * 70)
+    logger.info("  Page %d: saving %d valid record(s)", page_num, len(valid_records))
+    logger.info("─" * 60)
+    saved = await _save_valid_records(valid_records)
+    logger.info("  Page %d done: %d record(s) saved", page_num, saved)
+    return saved
+
+
 async def collect_exercises_data(headless: bool = True) -> int:
     login, password = _load_credentials()
 
@@ -94,12 +164,12 @@ async def collect_exercises_data(headless: bool = True) -> int:
                 body: Any = await response.json()
                 if isinstance(body, list):
                     captured_responses.extend(body)
-                    logger.info("Captured list with %d records", len(body))
+                    logger.info("  Captured list with %d records", len(body))
                 elif isinstance(body, dict):
                     captured_responses.append(body)
-                    logger.info("Captured single dict response")
+                    logger.info("  Captured single dict response")
             except Exception as exc:
-                logger.warning("Failed to parse response JSON: %s", exc)
+                logger.warning("  Failed to parse response JSON: %s", exc)
 
     def handle_response(response: Response) -> None:
         asyncio.ensure_future(_on_response(response))
@@ -115,7 +185,10 @@ async def collect_exercises_data(headless: bool = True) -> int:
                 headless=headless,
                 args=["--no-sandbox", "--disable-setuid-sandbox"],
             )
-            logger.info("  Browser PID: %s", getattr(browser, "pid", "N/A") if browser else "N/A")
+            logger.info(
+                "  Browser PID: %s",
+                getattr(browser, "pid", "N/A") if browser else "N/A",
+            )
 
             logger.info("  Creating new page (1920x1080) ...")
             page: Page = await browser.new_page(
@@ -152,80 +225,91 @@ async def collect_exercises_data(headless: bool = True) -> int:
             await page.goto(EXERCISES_URL, wait_until="networkidle", timeout=30000)
             logger.info("  Exercises page loaded. URL: %s", page.url)
 
+            # ── Pagination loop ──
             logger.info("─" * 60)
-            logger.info("STEP 4/6: Waiting for API responses (5s)")
+            logger.info("STEP 4/6: Pagination loop")
             logger.info("─" * 60)
-            logger.info("  Waiting 5 seconds for AJAX requests to settle ...")
-            await asyncio.sleep(5)
 
-            total_captured = len(captured_responses)
-            logger.info("  Done! Captured %d individual record(s) from query.php", total_captured)
+            total_saved: int = 0
+            page_num: int = 0
+            slice_start: int = 0
 
-            if not captured_responses:
-                raise RuntimeError(
-                    f"No POST responses captured from {API_QUERY_URL}"
+            while True:
+                page_num += 1
+                logger.info("─" * 60)
+                logger.info("  PAGE %d", page_num)
+                logger.info("─" * 60)
+
+                logger.info(
+                    "  Waiting %d seconds for AJAX requests ...",
+                    PAGE_WAIT_SECONDS,
+                )
+                await asyncio.sleep(PAGE_WAIT_SECONDS)
+
+                if page_num == 1 and not captured_responses:
+                    raise RuntimeError(
+                        f"No POST responses captured from {API_QUERY_URL}"
+                    )
+
+                saved = await _process_page(
+                    captured_responses,
+                    page_num,
+                    slice_start,
+                )
+                total_saved += saved
+
+                logger.info("  Looking for next-page button ...")
+
+                next_button = None
+
+                main_button = page.locator('button.q-btn[aria-label="Следующая страница"]')
+                if await main_button.count() > 0:
+                    next_button = main_button
+                else:
+                    for frame in page.frames:
+                        frame_button = frame.locator('button.q-btn[aria-label="Следующая страница"]')
+                        if await frame_button.count() > 0:
+                            logger.info("  Found in frame: %s", frame.url)
+                            next_button = frame_button
+                            break
+
+                if next_button:
+                    is_disabled = await next_button.evaluate(
+                        "el => el.classList.contains('disabled') || el.disabled"
+                    )
+                    has_next = not is_disabled
+                else:
+                    has_next = False
+
+                if not has_next:
+                    logger.info(
+                        "  Next-page button not found – parsing complete "
+                        "(%d page(s), %d record(s) saved)",
+                        page_num,
+                        total_saved,
+                    )
+                    break
+
+                logger.info("  Clicking next-page button ...")
+                await next_button.click()
+
+                # Capture state NOW so any responses arriving after the click
+                # but before the wait are included in the next batch
+                slice_start = len(captured_responses)
+                logger.info(
+                    "  Click done, slice_start=%d, moving to page %d",
+                    slice_start,
+                    page_num + 1,
                 )
 
             logger.info("─" * 60)
-            logger.info("STEP 5/6: Collecting all valid records")
-            logger.info("─" * 60)
             logger.info(
-                "  Scanning all %d captured records (reverse order)",
-                total_captured,
-            )
-            logger.info("  Looking for records with keys: %s", REQUIRED_KEYS)
-            logger.info("─" * 70)
-
-            valid_records = _find_all_valid(captured_responses)
-            valid_count = len(valid_records)
-
-            if valid_count == 0:
-                logger.info("─" * 70)
-                raise RuntimeError(
-                    f"No valid record found among all {total_captured} responses "
-                    f"- none contained all required keys: {REQUIRED_KEYS}"
-                )
-
-            logger.info("─" * 70)
-            logger.info("STEP 6/6: Saving %d valid record(s) to database", valid_count)
-            logger.info("─" * 60)
-
-            saved_count = 0
-            for idx, record_data in enumerate(valid_records, 1):
-                try:
-                    record = await sync_to_async(ExerciseRecord.from_api_response)(record_data)
-                    await sync_to_async(record.save)()
-                    saved_count += 1
-                    logger.info(
-                        "  [%d/%d] ✓ %s — %s (score=%s)",
-                        idx, valid_count,
-                        record.user_name,
-                        record.task_title,
-                        record.result_score,
-                    )
-                except IntegrityError:
-                    logger.info(
-                        "  [%d/%d] – %s — %s (already exists, skipped)",
-                        idx, valid_count,
-                        record_data.get("userName", "?"),
-                        record_data.get("taskTitle", "?"),
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "  [%d/%d] ✗ Failed to save record #%s: %s",
-                        idx, valid_count,
-                        record_data.get("id", "?"),
-                        exc,
-                    )
-
-            logger.info("─" * 60)
-            logger.info(
-                "  Done! %d of %d valid record(s) saved to database",
-                saved_count,
-                valid_count,
+                "  DONE! Total: %d page(s), %d record(s) saved",
+                page_num,
+                total_saved,
             )
             logger.info("─" * 60)
-            return saved_count
+            return total_saved
 
     except Exception:
         logger.exception("✗ Exercise collection failed")
