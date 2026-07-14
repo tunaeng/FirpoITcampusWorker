@@ -29,3 +29,6 @@ Thumbs.db
 
 media/
 php/
+
+*.exe
+*.bat
