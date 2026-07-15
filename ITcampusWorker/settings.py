@@ -12,6 +12,9 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 
 from pathlib import Path
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -85,6 +88,14 @@ DATABASES = {
         'PORT': os.getenv('DB_PORT', '5432'),
     }
 }
+
+_db_schema = os.getenv('DB_SCHEMA', '').strip()
+if _db_schema:
+    # Quote to preserve mixed case (PostgreSQL lowercases unquoted identifiers)
+    quoted = f'"{_db_schema}"' if _db_schema != _db_schema.lower() else _db_schema
+    DATABASES['default']['OPTIONS'] = {
+        'options': f'-c search_path={quoted},public'
+    }
 
 
 # Password validation
