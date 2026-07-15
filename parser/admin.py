@@ -7,5 +7,5 @@ admin.site.index_title = "Добро пожаловать в панель упр
 
 @admin.register(ExerciseRecord)
 class ExerciseRecordAdmin(admin.ModelAdmin):
-    list_display = ("record_id", "user_name", "module_title", "answer")
+    list_display = ("record_id", "user_name", "module_title", "status", "answer")
     

@@ -1,4 +1,7 @@
 from django.db import models
+from django.utils import timezone
+import datetime as dt_mod
+import json as _json
 
 
 class ExerciseRecord(models.Model):
@@ -65,6 +68,18 @@ class ExerciseRecord(models.Model):
     manual_check = models.BooleanField(default=False)
     check_minutes = models.CharField(max_length=10, blank=True, default="")
 
+    STATUS_CHOICES: list[tuple[str, str]] = [
+        ("no_work", "Нет работы"),
+        ("has_work", "Есть работа"),
+        ("has_mark", "Есть отметка"),
+    ]
+
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default="no_work",
+    )
+
     raw_data = models.JSONField(default=dict)
     created = models.DateTimeField(auto_now_add=True)
     updated = models.DateTimeField(auto_now=True)
@@ -77,6 +92,23 @@ class ExerciseRecord(models.Model):
             models.Index(fields=["exercise_id", "user_id"]),
             models.Index(fields=["user_name"]),
         ]
+
+    @staticmethod
+    def _compute_status_static(passed: bool, answer: str, files: object) -> str:
+        if passed:
+            return "has_mark"
+        has_answer = bool(answer and str(answer).strip())
+        has_files = bool(files)  # non-empty list/dict => work submitted
+        if has_answer or has_files:
+            return "has_work"
+        return "no_work"
+
+    def _compute_status(self) -> str:
+        return self._compute_status_static(self.passed, self.answer or "", self.files)
+
+    def save(self, *args, **kwargs):
+        self.status = self._compute_status()
+        super().save(*args, **kwargs)
 
     def __str__(self) -> str:
         return f"{self.user_name} – {self.task_title} ({self.record_id})"
@@ -92,8 +124,6 @@ class ExerciseRecord(models.Model):
             return bool(val)
 
         def _parse_dt(val: object):
-            from django.utils import timezone
-            import datetime as dt_mod
             if not val:
                 return None
             try:
@@ -103,7 +133,6 @@ class ExerciseRecord(models.Model):
                 return None
 
         def _parse_date(val: object):
-            import datetime as dt_mod
             if not val:
                 return None
             try:
@@ -112,7 +141,6 @@ class ExerciseRecord(models.Model):
                 return None
 
         def _parse_json_field(val: object):
-            import json as _json
             if isinstance(val, (list, dict)):
                 return val
             if isinstance(val, str) and val.strip():
@@ -122,6 +150,7 @@ class ExerciseRecord(models.Model):
                     pass
             return val if val else []
 
+        files_value = _parse_json_field(data.get("files"))
         return cls(
             record_id=_str(data.get("id")),
             exercise_id=_str(data.get("exercise_id")),
@@ -139,7 +168,7 @@ class ExerciseRecord(models.Model):
             checking_at=_parse_dt(data.get("checking_at")),
             approved_at=_parse_dt(data.get("approved_at")),
             answer=_str(data.get("answer")),
-            files=_parse_json_field(data.get("files")),
+            files=files_value,
             check_comment=_str(data.get("check_comment")),
             exercise_title=_str(data.get("exerciseTitle")),
             exercise_description=_str(data.get("exerciseDescription")),
@@ -177,4 +206,9 @@ class ExerciseRecord(models.Model):
             manual_check=_bool(data.get("manualCheck")),
             check_minutes=_str(data.get("check_minutes")),
             raw_data=data,
+            status=cls._compute_status_static(
+                _bool(data.get("passed")),
+                _str(data.get("answer")),
+                files_value,
+            ),
         )
