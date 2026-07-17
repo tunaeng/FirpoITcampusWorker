@@ -1,12 +1,18 @@
+import ast
 import asyncio
+import io
+import json
 import logging
 import os
+import re
 import sys
 from typing import Any
 from dotenv import load_dotenv
 load_dotenv()
 
+import httpx
 from asgiref.sync import sync_to_async
+from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 from playwright.async_api import async_playwright, Browser, Page, Response
 
@@ -59,8 +65,30 @@ def _extract_exercises(responses: list[Any]) -> list[dict[str, Any]]:
     return out
 
 
-async def _save_records(records: list[dict[str, Any]]) -> int:
-    saved = 0
+def _parse_files_field(value: Any) -> list:
+    """Parse API ``files`` field: JSON, Python repr (single quotes), or already a list."""
+    if isinstance(value, list):
+        return value
+    if not isinstance(value, str):
+        return []
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, list):
+            return parsed
+    except (json.JSONDecodeError, TypeError):
+        pass
+    try:
+        parsed = ast.literal_eval(value)
+        if isinstance(parsed, list):
+            return parsed
+    except (ValueError, SyntaxError, MemoryError, TypeError):
+        pass
+    return []
+
+
+async def _save_records(records: list[dict[str, Any]]) -> list[ExerciseRecord]:
+    """Save records via update_or_create and return the saved objects."""
+    saved_objs: list[ExerciseRecord] = []
     for idx, data in enumerate(records, 1):
         try:
             record = await sync_to_async(ExerciseRecord.from_api_response)(data)
@@ -68,22 +96,116 @@ async def _save_records(records: list[dict[str, Any]]) -> int:
                 f.name for f in ExerciseRecord._meta.get_fields()
                 if not f.auto_created
                 and not f.primary_key
-                and f.name not in ("id", "record_id", "created", "updated")
+                and f.name not in ("id", "record_id", "created", "updated", "files")
             ]
             defaults = {f: getattr(record, f) for f in field_names}
             obj, created = await sync_to_async(
                 ExerciseRecord.objects.update_or_create
             )(record_id=record.record_id, defaults=defaults)
+            obj.raw_files = _parse_files_field(data.get("files"))  # attach raw API files for later upload
+            saved_objs.append(obj)
             logger.info(
                 "  [%d/%d] %s %s",
                 idx, len(records),
                 "✓ new" if created else "🔄 upd",
                 record.user_name,
             )
-            saved += 1
         except Exception as exc:
             logger.warning("  [%d/%d] ✗ skip: %s", idx, len(records), exc)
-    return saved
+    return saved_objs
+
+
+def _sanitize_filename(name: str) -> str:
+    name = re.sub(r'[^\w.\-]', '_', name, flags=re.UNICODE)
+    name = re.sub(r'_+', '_', name).strip('_')
+    return name or 'unknown'
+
+
+def _minio_client():
+    from minio import Minio
+    return Minio(
+        settings.MINIO_ENDPOINT,
+        access_key=settings.MINIO_ACCESS_KEY,
+        secret_key=settings.MINIO_SECRET_KEY,
+        secure=settings.MINIO_SECURE,
+    )
+
+
+def _put_to_minio(object_name: str, content: bytes) -> None:
+    client = _minio_client()
+    bucket = settings.MINIO_BUCKET
+    if not client.bucket_exists(bucket):
+        client.make_bucket(bucket)
+    client.put_object(bucket, object_name, io.BytesIO(content), len(content))
+
+
+async def _download_file(url: str, cookies: dict[str, str]) -> bytes:
+    async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=60.0) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        return resp.content
+
+
+async def _upload_records_files(page: Page, objs: list[ExerciseRecord]) -> None:
+    """Download each file from the raw API urls and upload to MinIO.
+
+    Updates the record's ``files`` field to a list of MinIO paths.
+    """
+    if not settings.MINIO_ACCESS_KEY or not settings.MINIO_ENDPOINT:
+        logger.info("  MinIO not configured — skipping file upload")
+        return
+
+    logger.info("  📦 bucket=%s, endpoint=%s", settings.MINIO_BUCKET, settings.MINIO_ENDPOINT)
+
+    cookies = {
+        c["name"]: c["value"]
+        for c in await page.context.cookies()
+        if "edu.firpo.ru" in c["domain"]
+    }
+
+    total_files = sum(1 for obj in objs for e in (getattr(obj, "raw_files", []) or []) if isinstance(e, dict) and e.get("url"))
+    total_records = sum(1 for obj in objs if getattr(obj, "raw_files", []))
+    ok_count = 0
+    fail_count = 0
+
+    if not total_files:
+        logger.info("  No files to upload for %d record(s)", len(objs))
+        return
+
+    logger.info("  %d file(s) across %d record(s)", total_files, total_records)
+
+    for obj in objs:
+        raw_files: Any = getattr(obj, "raw_files", [])
+        if not raw_files or not isinstance(raw_files, list):
+            continue
+
+        new_paths: list[str] = []
+        for entry in raw_files:
+            if not isinstance(entry, dict):
+                continue
+            url = entry.get("url", "")
+            name = entry.get("name", "unknown")
+            if not url or not isinstance(url, str):
+                continue
+
+            try:
+                content = await _download_file(url, cookies)
+                safe_name = _sanitize_filename(name)
+                object_name = f"solutions/{obj.record_id}/{safe_name}"
+                await asyncio.to_thread(_put_to_minio, object_name, content)
+                new_paths.append(object_name)
+                ok_count += 1
+                logger.info("    ✅ %s  (%.1f KB) → %s", name, len(content) / 1024, object_name)
+            except Exception as exc:
+                fail_count += 1
+                logger.warning("    ❌ %s — %s", name, exc)
+
+        if new_paths:
+            obj.files = new_paths
+            await sync_to_async(obj.save)(update_fields=["files"])
+            logger.info("    🗂  record %s: %d file(s) saved", obj.record_id, len(new_paths))
+
+    logger.info("  📊 MinIO upload done: %d OK, %d failed", ok_count, fail_count)
 
 
 async def _has_next_page(page: Page) -> bool:
@@ -242,9 +364,12 @@ async def collect_exercises_data(headless: bool = True) -> int:
                     "  Page %d: scanned %d new response(s), exercise records=%d",
                     page_num, len(new_responses), len(records),
                 )
-                saved = await _save_records(records)
-                total_saved += saved
-                logger.info("  Page %d saved %d record(s)", page_num, saved)
+                saved_objs = await _save_records(records)
+                total_saved += len(saved_objs)
+                logger.info("  Page %d saved %d record(s)", page_num, len(saved_objs))
+
+                if saved_objs:
+                    await _upload_records_files(page, saved_objs)
 
                 if not await _has_next_page(page):
                     logger.info("No next page — done (%d page(s), %d saved)", page_num, total_saved)

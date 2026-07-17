@@ -135,3 +135,10 @@ USE_TZ = True
 STATIC_URL = 'static/'
 
 CSRF_TRUSTED_ORIGINS = [os.getenv("CSRF_TRUSTED_ORIGINS", "")]
+
+# S3/MinIO — supports both MINIO_* and AWS_* env var names
+MINIO_ENDPOINT = os.getenv('MINIO_ENDPOINT') or os.getenv('AWS_S3_ENDPOINT_URL', 'play.min.io')
+MINIO_ACCESS_KEY = os.getenv('MINIO_ACCESS_KEY') or os.getenv('AWS_ACCESS_KEY_ID', '')
+MINIO_SECRET_KEY = os.getenv('MINIO_SECRET_KEY') or os.getenv('AWS_SECRET_ACCESS_KEY', '')
+MINIO_BUCKET = os.getenv('MINIO_BUCKET') or os.getenv('AWS_STORAGE_BUCKET_NAME', 'solutions')
+MINIO_SECURE = (os.getenv('MINIO_SECURE') or os.getenv('AWS_S3_USE_SSL', 'True')).lower() in ('true', '1', 'yes')
